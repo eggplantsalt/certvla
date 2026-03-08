@@ -6,6 +6,8 @@ __pycache__/
 # C extensions
 *.so
 
+LIBERO/
+
 # Distribution / packaging
 .Python
 build/
@@ -150,4 +152,29 @@ data/
 
 # Rollout videos and wandb logs
 rollouts/
+wandb/
+
+
+
+# 模型
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+
+# 数据
+data/
+datasets/
+*.zip
+*.tar
+*.gz
+*.npy
+*.npz
+
+# 输出
+outputs/
+checkpoints/
+logs/
 wandb/
