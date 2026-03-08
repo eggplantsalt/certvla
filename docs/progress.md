@@ -158,11 +158,137 @@ The one design decision that avoids modifying `modeling_prismatic.py` now is: `C
 
 ### Next Phase Recommendations
 
-**Phase 3: Training Layer** should implement:
-1. Loss functions: L_state, L_role, L_goal, L_act, L_cons, L_dep, L_cf
-2. Training curriculum (staged loss weight scheduling)
-3. Scheduled sampling for state token
-4. Custom dataset that joins RLDS batches with sidecar labels
-5. Integration with `finetune.py` (state token injection into VLA forward pass)
-6. Config dataclass extensions for cert training
+**Phase 3: Training Layer** — see below.
+
+---
+
+## Phase 3: Training Layer — COMPLETE
+
+### Completed
+
+| File | Description |
+|------|-------------|
+| `certvla/training/__init__.py` | Training subpackage, re-exports all loss functions, curriculum, sampler |
+| `certvla/training/losses.py` | All 7 loss functions: `cert_state_loss`, `cert_role_loss` (focal CE), `cert_goal_loss`, `cert_action_loss` (L1), `cert_consistency_loss` (advance + preserve), `cert_dependence_loss` (margin/triplet), `cert_counterfactual_loss` (invariance + breaking, minimal v1), `cert_total_loss` (weighted combiner). Helpers: `focal_cross_entropy`, `_per_slot_loss`, `_slot_pred_distance` |
+| `certvla/training/curriculum.py` | `TrainingStage` enum (4 stages), `StageConfig` dataclass (loss weights + freeze flags + hyper-params), `DEFAULT_STAGES` dict, `CurriculumScheduler` (step-based stage lookup, `get_loss_weights()`, `should_compute_dep()`, `should_compute_cf()`) |
+| `certvla/training/sched_sampling.py` | `ScheduledSampler` with constant/linear/cosine schedules, warmup support, `get_teacher_force_prob()`, `should_use_teacher()` |
+| `tests/test_losses.py` | 30 tests: focal CE (3), L_state (3), L_role (2), L_goal (2), L_act (1), L_cons (2), L_dep (2), L_cf (3), total loss (2), curriculum (6), scheduled sampling (4), full smoke (1) |
+
+**Test results: 144/144 passed (74 Phase 1 + 21 Phase 2 + 30 Phase 3 + 19 Phase 4)** (1.56s)
+
+### Loss Functions Summary
+
+| Loss | Symbol | File Location | Key Design |
+|------|--------|--------------|------------|
+| State readout | `L_state` | `losses.py:117` | Per-slot BCE/CE/L1 with mask × confidence weighting |
+| Certificate role | `L_role` | `losses.py:148` | Focal CE (gamma=2.0) over J_CERT, handles class imbalance |
+| Advance goal | `L_goal` | `losses.py:179` | Per-slot loss only where role==advance |
+| Action chunk | `L_act` | `losses.py:215` | L1 regression, mean over (H × action_dim) |
+| Consistency | `L_cons` | `losses.py:232` | Advance: goal vs GT@t+H. Preserve: readout vs GT@t+H. lambda_pre weight |
+| Dependence | `L_dep` | `losses.py:292` | Margin triplet: max(0, m + e_pos - e_neg). Requires 2 action-head forwards |
+| Counterfactual | `L_cf` | `losses.py:319` | L_inv (MSE invariance) + L_brk (margin divergence). No-op if no augmented pairs |
+| **Total** | `L` | `losses.py:377` | Weighted sum via lambda_s..lambda_cf from StageConfig |
+
+### Stage 1–4 Configuration
+
+| Stage | Name | Active Losses | Frozen | Trainable |
+|-------|------|---------------|--------|-----------|
+| 1 | `stage1_state` | L_state | backbone, cert head, action head | state token + readout |
+| 2 | `stage2_certificate` | L_state + L_role + L_goal | backbone, action head | state + cert head |
+| 3 | `stage3_policy` | All supervised (+ L_cons, L_dep) | backbone | state + cert + action |
+| 4 | `stage4_counterfactual` | All + L_cf | backbone | state + cert + action |
+
+Default step boundaries: 0–5K / 5K–15K / 15K–40K / 40K–60K (configurable).
+
+### Design Decisions Made
+
+1. **Per-slot loss uses domain-appropriate functions**: BCE for binary (after sigmoid), CE for categorical (raw logits), L1 for continuous/confidence (after sigmoid). All losses reduce to scalar via mask × confidence × mean.
+
+2. **Focal CE for role classification**: gamma=2.0 down-weights easy "ignore" examples. gamma=0 recovers standard CE (verified by test).
+
+3. **Consistency loss uses GT at t+H in v1**: Since v1 does single-chunk training without recurrence, the model does not produce state predictions at t+H. Advance consistency reduces to reinforcing L_goal; preserve consistency is unique (forces readout stability for preserved slots).
+
+4. **L_dep requires two forward passes through action head**: One with correct certificate, one with corrupted certificate. `CurriculumScheduler.should_compute_dep()` allows skipping in early stages.
+
+5. **L_cf is a no-op without augmented pairs**: Returns zero gracefully. Full augmented-image pipeline is deferred. The interface supports nuisance-preserving (L_inv) and consequence-breaking (L_brk) terms when z_pos/z_neg embeddings are provided.
+
+6. **Scheduled sampling v1 default**: constant schedule at prob=1.0 (always use z_0). Linear/cosine decay available for v2 episode-sequential training.
+
+### Known Risks
+
+1. **7 loss terms with weight scheduling is fragile**: Default weights are conservative (1.0 for primary, 0.5 for auxiliary). Will need grid search or automated tuning.
+
+2. **L_dep doubles memory for action head**: Two forward passes through the action head per training step. `should_compute_dep()` gate prevents this in stages 1–2.
+
+3. **Consistency loss advance term is redundant with L_goal in v1**: Both measure goal_pred vs GT@t+H. The preserve component provides unique signal.
+
+---
+
+## Phase 4: Inference & Repair — COMPLETE
+
+### Completed
+
+| File | Description |
+|------|-------------|
+| `certvla/inference/__init__.py` | Inference subpackage, re-exports gap, repair, logger |
+| `certvla/inference/gap.py` | `slot_gap()`: per-slot role-probability-weighted gap. `aggregate_certificate_gap()`: confidence-weighted aggregation with slot importance. `GapResult` dataclass |
+| `certvla/inference/repair.py` | `RepairController`: short-horizon local repair loop. `RepairConfig`: threshold, max attempts. Accepts `model_fn` callable (decoupled from model class) |
+| `certvla/inference/logging.py` | `InferenceLogger`: episode-level trace collection. `StepRecord`, `EpisodeTrace` dataclasses. Summary statistics, warning recording, episode pruning |
+| `tests/test_inference.py` | 19 tests: slot gap (4), aggregated gap (5), repair controller (3), logger (5), end-to-end fake rollout (1 + CertVLAWrapper) |
+
+**Test results: 144/144 passed** (1.56s)
+
+### Gap Definition & Implementation
+
+**Per-slot gap** (`certvla/inference/gap.py:slot_gap`):
+```
+gamma_t^j = p_adv^j * d_j(goal^j, s_{t+H}^j)
+          + p_pre^j * d_j(s_t^j,   s_{t+H}^j)
+```
+- `p_adv`, `p_pre` = softmax(role_logits) role probabilities
+- `d_j` = differentiable per-slot distance (L1 for binary/continuous, TV for categorical)
+- Only computed for J_CERT (9 cert slots)
+
+**Aggregated gap** (`certvla/inference/gap.py:aggregate_certificate_gap`):
+```
+Gamma_t = [ sum_j omega_j * kappa_j * gamma_j ]
+        / [ sum_j omega_j * kappa_j + epsilon ]
+```
+- `omega_j` = static slot importance weight (default 1.0)
+- `kappa_j` = dynamic confidence weight
+- Returns `GapResult` with per_slot, aggregated, and role_probs
+
+### Repair Loop
+
+`RepairController` (`certvla/inference/repair.py`):
+1. Run initial forward via `model_fn(hidden, stp, asp, z_prev) -> CertVLAOutput`
+2. Compute gap via `slot_gap()` + `aggregate_certificate_gap()`
+3. If `gap.aggregated.mean() > threshold` → re-forward up to `max_repair_steps` times
+4. Accept the attempt with lowest gap (best-of-N strategy)
+5. Log all attempts and warnings via `InferenceLogger`
+
+The `model_fn` callable decouples the repair loop from the concrete model class. At integration time it wraps `CertVLAWrapper.forward()`.
+
+**v1 gap proxy**: Since the model only processes observation at time t, `state_readout_tH` is not available from a single forward pass. The v1 fallback uses `goal_preds` as the expected t+H state, yielding a self-consistency gap.
+
+### Modifications to Existing Code: NONE
+
+Phase 4 is fully additive. Zero files in `prismatic/` or `vla-scripts/` were modified.
+
+### Known Risks
+
+1. **v1 gap proxy is weak**: Using goal_preds as state_tH proxy means advance gap is always d(goal, goal) = 0. Real gap requires either a second forward pass with o_{t+H} or episode-sequential inference. The preserve gap (d(s_t, goal)) still provides useful signal.
+
+2. **Repair loop is stateless**: Each re-forward uses the same hidden states and z_prev. Without model stochasticity (dropout, temperature), re-forwards may produce identical results. At inference time, the model should use either dropout or temperature > 0 for repair to be effective.
+
+3. **No full replanner**: The repair loop is local retry only. It does not re-plan the task, modify the instruction, or use external symbolic reasoning. Full replanning is future scope.
+
+### Next Phase Recommendations
+
+**Phase 5: Integration** should implement:
+1. State token injection into the VLA forward pass (modify `finetune.py`)
+2. Custom dataset joining RLDS batches with sidecar labels
+3. Config dataclass extensions for cert training
+4. End-to-end training script with curriculum scheduler
+5. Evaluation harness for LIBERO tasks with gap monitoring
 
