@@ -65,13 +65,104 @@
 
 ### Next Phase Recommendations
 
-**Phase 2: Model Layer** should implement:
-1. Persistent state token (`certvla/model/state_token.py`)
-2. State readout head R_phi (`certvla/model/state_readout.py`)
-3. Certificate head Q_psi (`certvla/model/certificate_head.py`)
-4. Cert-conditioned action head (`certvla/model/action_head.py`)
-5. CertVLA wrapper (`certvla/model/certvla_wrapper.py`)
-6. Modifications to `modeling_prismatic.py` to inject state token
-7. Shape/smoke tests
+**Phase 2: Model Layer** — see below.
 
-**Before Phase 2**: Complete Task 1.11 (LIBERO env investigation) if a LIBERO-capable machine is available. This unblocks `LiberoOracleLabeler` implementation and real sidecar label generation.
+---
+
+## Phase 2: Model Layer — COMPLETE
+
+### Completed
+
+| File | Description |
+|------|-------------|
+| `certvla/model/__init__.py` | Model subpackage |
+| `certvla/model/outputs.py` | `CertVLAOutput` dataclass: z_t, state_readout, role_logits, goal_preds, actions (coarse + fine + combined), gate_value |
+| `certvla/model/state_token.py` | `StateTokenModule`: learnable z_0, `get_state_token_embedding()`, `gated_update()` with sigmoid gate |
+| `certvla/model/state_readout.py` | `StateReadoutHead`: z_t -> per-slot predictions. Shared trunk + per-slot output heads. Binary/continuous use sigmoid; categorical outputs raw logits |
+| `certvla/model/certificate_head.py` | `CertificateHead`: z_t -> per-slot (role_logits, goal_preds) for J_CERT (9 slots). 3-way role classification [advance/preserve/ignore] + domain-appropriate goal predictions |
+| `certvla/model/action_head.py` | `CertActionHead`: coarse + fine residual architecture. `CoarseActionBranch` (z_t + cert, no observation), `FineActionBranch` (actions_hidden_states + z_t + cert), `CertificateEmbedding`, learnable `lambda_res` |
+| `certvla/model/certvla_wrapper.py` | `CertVLAWrapper`: composes all heads. Takes LLM `last_hidden_states` + position indices, returns `CertVLAOutput`. Does NOT subclass or modify base VLA |
+| `tests/test_model_shapes.py` | 21 tests: shape verification, gradient isolation, certificate influence, parameter counts, full forward smoke test |
+
+**Test results: 95/95 passed (74 Phase 1 + 21 Phase 2)** (2.08s)
+
+### Architecture Summary
+
+```
+LLM last_hidden_states (B, seq_len, 4096)
+  |
+  |-- [state_token_pos] --> tilde_z_t (B, 4096)
+  |                           |
+  |                      gated_update(tilde_z_t, z_prev)
+  |                           |
+  |                         z_t (B, 4096)
+  |                        /    \
+  |          StateReadoutHead  CertificateHead
+  |              |                |
+  |          s_t (10 slots)   role_logits (9 slots x 3)
+  |                           goal_preds (9 slots x dim)
+  |                                |
+  |                        CertificateEmbedding
+  |                                |
+  |                           cert_embed (B, 256)
+  |                           /          \
+  |-- [action positions] --> FineActionBranch  CoarseActionBranch
+  |                           |                    |
+  |                    actions_fine          actions_coarse
+  |                           \                  /
+  |                      actions = coarse + lambda_res * fine
+  |                              (B, 8, 7)
+```
+
+### Design Constraints Satisfied
+
+1. **State readout only reads from z_t**: `StateReadoutHead.forward(z_t)` takes a single vector. Test `test_readout_isolated_from_action_tokens` verifies gradients at action positions are zero when only readout loss is backpropagated.
+2. **Certificate only reads from z_t**: Same architecture pattern as readout. Test `test_gradient_only_through_z_t` verifies.
+3. **Action head explicitly receives certificate**: `CertActionHead.forward()` requires `role_logits` and `goal_preds` arguments. Test `test_cert_influences_actions` verifies changing certificate changes output.
+4. **Fine branch accesses observation (via actions_hidden_states)**: `FineActionBranch` receives LLM hidden states which encode visual+text tokens.
+5. **Single persistent state token**: `StateTokenModule` provides one `z_0` embedding of shape `(1, llm_dim)`.
+6. **No external memory bank, no NL certificates, no symbolic planner**: Only structured slot outputs.
+
+### Modifications to Existing Code: NONE
+
+Phase 2 is fully additive. **Zero files in `prismatic/` or `vla-scripts/` were modified.** The wrapper operates on pre-extracted hidden states. Integration with the base VLA forward pass (injecting state token embedding into `_build_multimodal_attention`) is deferred to Phase 3.
+
+The one design decision that avoids modifying `modeling_prismatic.py` now is: `CertVLAWrapper` takes `last_hidden_states` and position indices as arguments, rather than hooking into the LLM forward. This means Phase 3 will need to:
+1. Append the state token embedding to `projected_patch_embeddings` before the LLM call
+2. Pass `output_hidden_states=True` to the LLM
+3. Call `CertVLAWrapper.forward()` with the extracted hidden states
+
+### Design Decisions Made
+
+1. **Wrapper pattern, not subclass**: `CertVLAWrapper` is a standalone `nn.Module`, not a subclass of `OpenVLAForActionPrediction`. This maximizes decoupling from the base model.
+
+2. **No `prismatic` imports in `certvla/model/`**: To avoid triggering the heavy `prismatic` import chain (which requires `draccus`, `tensorflow`, etc.), all model modules define default constants locally (`_DEFAULT_ACTION_DIM = 7`, `_DEFAULT_NUM_ACTIONS_CHUNK = 8`) and accept dimensions as constructor parameters. At runtime (Phase 3), the actual constants from `prismatic.vla.constants` are passed in.
+
+3. **Gate initialization**: `gate_proj` weights and biases are zero-initialized so the initial gate value is ~0.5 (balanced mix of new and old state). This follows standard practice for gated residual connections.
+
+4. **Coarse branch has NO observation access**: `CoarseActionBranch` only sees `z_t + cert_embed`. This is a hard architectural constraint that ensures the coarse action semantics depend on the certificate. The `FineActionBranch` adds geometric correction using `actions_hidden_states` (which encode visual observations).
+
+5. **Learnable `lambda_res`**: Initialized to 0.1 so the fine residual starts small and grows as training progresses. This prevents the fine branch from dominating early in training when the certificate is still noisy.
+
+6. **Shared trunk per head**: State readout and certificate head each use a 2-layer shared trunk before per-slot output projections. This reduces parameter count while allowing per-slot specialization.
+
+### Known Risks
+
+1. **State token position in sequence**: The current design assumes the state token is inserted at a known position (after vision patches). In Phase 3, the exact position must be computed correctly accounting for BOS token, number of vision patches, and optional proprio/diffusion tokens.
+
+2. **Fine branch input dimension**: `FineActionBranch` concatenates `(action_dim * llm_dim + llm_dim + cert_embed_dim)` per chunk step. With real dimensions (7 * 4096 + 4096 + 256 = 32,928), this is large. If memory is a concern, Phase 3 may need to add a projection layer to reduce the action hidden state dimension before concatenation.
+
+3. **Parameter count**: With real `llm_dim=4096`, the CertVLA wrapper has ~70-100M parameters (dominated by the fine branch's large input projection). This is ~1-1.5% of the 7B base model, which is acceptable but should be monitored.
+
+4. **v1 training: z_prev = z_0 always**: At training time, every sample uses the learnable z_0 as the "previous state." This means the gated update learns a residual structure but never experiences true recurrence. Episode-sequential training is a v2 enhancement.
+
+### Next Phase Recommendations
+
+**Phase 3: Training Layer** should implement:
+1. Loss functions: L_state, L_role, L_goal, L_act, L_cons, L_dep, L_cf
+2. Training curriculum (staged loss weight scheduling)
+3. Scheduled sampling for state token
+4. Custom dataset that joins RLDS batches with sidecar labels
+5. Integration with `finetune.py` (state token injection into VLA forward pass)
+6. Config dataclass extensions for cert training
+
